@@ -116,6 +116,7 @@ export class World extends DurableObject {
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS sessions (hash TEXT PRIMARY KEY, acc INTEGER NOT NULL)"
     );
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS admin_sessions (hash TEXT PRIMARY KEY)");
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ctx.blockConcurrencyWhile(async () => {
       for (const w of [1, 2, 3]) {
@@ -269,6 +270,52 @@ export class World extends DurableObject {
     return { ...row, total: c.total };
   }
 
+  // ---------- Yönetici ----------
+  // Kod koda yazılmaz: Cloudflare'da ADMIN_CODE adlı gizli değer (secret) olarak tutulur.
+  async adminLogin(body, ip) {
+    const secret = String((this.env && this.env.ADMIN_CODE) || "");
+    if (!secret) throw new ApiError("Yönetici özelliği kapalı", 503);
+    if (this.tooMany("adm:" + ip, 5) || this.tooMany("adm:all", 20)) {
+      throw new ApiError("Çok fazla hatalı deneme, daha sonra tekrar dene", 429);
+    }
+    const given = await sha256hex(String(body.code || "").slice(0, 200));
+    const want = await sha256hex(secret);
+    if (!sameBytes(unhex(given), unhex(want))) {
+      this.hit("adm:" + ip, 3600 * 1000);
+      this.hit("adm:all", 3600 * 1000);
+      throw new ApiError("Yönetici kodu yanlış", 401);
+    }
+    const raw = hex(crypto.getRandomValues(new Uint8Array(32)));
+    this.ctx.storage.sql.exec("INSERT INTO admin_sessions (hash) VALUES (?)", await sha256hex(raw));
+    return { token: raw };
+  }
+
+  async adminLogout(body) {
+    const t = String(body.token || "");
+    if (t.length !== 64) return { ok: true };
+    const h = await sha256hex(t);
+    this.ctx.storage.sql.exec("DELETE FROM admin_sessions WHERE hash = ?", h);
+    for (const s of this.ctx.getWebSockets()) {          // açık bağlantılarda da yetkiyi kaldır
+      const a = s.deserializeAttachment() || {};
+      if (a.ah === h) s.serializeAttachment({ ...a, admin: false, unl: false });
+    }
+    return { ok: true };
+  }
+
+  // Bir dünyanın haritasını tamamen boşaltır. Oyuncular bağlı kalır, ekranları temizlenir.
+  resetWorld(w) {
+    if (!WORLDS[w]) return;
+    this.worlds[w].fill(0);
+    this.dirty[w].clear();
+    this.ctx.storage.sql.exec("DELETE FROM " + WORLDS[w].table);
+    const msg = JSON.stringify({ type: "reset", world: w });
+    for (const s of this.ctx.getWebSockets()) {
+      const a = s.deserializeAttachment() || {};
+      if ((WORLDS[a.w] ? a.w : 1) !== w) continue;
+      try { s.send(msg); } catch (e) { /* kapanmış bağlantı */ }
+    }
+  }
+
   async api(request) {
     if (request.method !== "POST") return jsonRes({ error: "Yanlış istek" }, 405);
     let body;
@@ -281,6 +328,8 @@ export class World extends DurableObject {
       if (path === "/api/login") return jsonRes(await this.login(body, ip));
       if (path === "/api/recover") return jsonRes(await this.recover(body, ip));
       if (path === "/api/logout") return jsonRes(await this.logout(body));
+      if (path === "/api/admin") return jsonRes(await this.adminLogin(body, ip));
+      if (path === "/api/adminlogout") return jsonRes(await this.adminLogout(body));
       return jsonRes({ error: "Bulunamadı" }, 404);
     } catch (e) {
       if (e instanceof ApiError) return jsonRes({ error: e.message }, e.status);
@@ -295,12 +344,22 @@ export class World extends DurableObject {
     const acc = token ? await this.accountByToken(token) : null;
     // Misafir kimliği "g" ile başlar, hesap kimliği "a" ile: ikisi karışmaz
     const id = acc ? "a" + acc.id : "g" + ((url.searchParams.get("id") || "").slice(0, 40) || crypto.randomUUID());
+    const atok = url.searchParams.get("atok") || "";
+    let admin = false, ah = "";
+    if (atok.length === 64) {
+      ah = await sha256hex(atok);
+      admin = this.rows("SELECT 1 FROM admin_sessions WHERE hash = ?", ah).length > 0;
+    }
     const wq = parseInt(url.searchParams.get("w") || "1", 10);
     const w = WORLDS[wq] ? wq : 1;
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment(acc ? { id, acc: acc.id, w } : { id, w });
+    const att0 = acc ? { id, acc: acc.id, w } : { id, w };
+    if (admin) { att0.admin = true; att0.ah = ah; }
+    server.serializeAttachment(att0);
+    if (admin) server.send(JSON.stringify({ type: "admin", ok: true }));
+    else if (atok) server.send(JSON.stringify({ type: "badadmin" }));
     if (acc) {
       const now = Date.now();
       const rk = id + "|" + w;
@@ -342,7 +401,17 @@ export class World extends DurableObject {
   }
 
   async webSocketMessage(ws, message) {
-    if (typeof message === "string") return; // "ping" otomatik yanıtlanıyor
+    if (typeof message === "string") {
+      // "ping" otomatik yanıtlanıyor; buraya yalnızca yönetici komutları gelir
+      if (message.charAt(0) !== "{" || message.length > 200) return;
+      let m;
+      try { m = JSON.parse(message); } catch (e) { return; }
+      const a = ws.deserializeAttachment() || {};
+      if (!a.admin || !m) return;                          // yönetici değilse hiçbir şey yapmaz
+      if (m.type === "unlimited") ws.serializeAttachment({ ...a, unl: m.on === true });
+      else if (m.type === "reset") this.resetWorld(Number(m.world));
+      return;
+    }
     if (message.byteLength === 0 || message.byteLength % 4 !== 0) return;
     if (message.byteLength > MAX_BATCH * 4) return;
 
@@ -350,6 +419,7 @@ export class World extends DurableObject {
     const att = ws.deserializeAttachment() || {};
     const id = att.id || "gbilinmiyor";
     const w = WORLDS[att.w] ? att.w : 1;      // eski bağlantılarda w yok: Dünya 1
+    const unl = !!(att.admin && att.unl);     // yönetici sınırsız modu
     const cfg = WORLDS[w];
     const world = this.worlds[w];
     const rk = id + "|" + w;
@@ -374,11 +444,11 @@ export class World extends DurableObject {
       const cur = world[idx];
       if (cur === c) continue;
       const cost = cur ? cfg.filled : cfg.empty;   // dolu hücre daha pahalı olabilir
-      if (r.used + cost > cfg.max + SLACK) {
+      if (!unl && r.used + cost > cfg.max + SLACK) {
         rejected.push(idx * 16 + cur);
         continue;
       }
-      r.used += cost;
+      if (!unl) r.used += cost;
       world[idx] = c;
       this.dirty[w].add(idx >>> 16);
       accepted.push(v);
@@ -395,77 +465,4 @@ export class World extends DurableObject {
       this.accDirty.add(att.acc + "|" + w);
     }
 
-    if (rejected.length) ws.send(new Uint32Array([T_REJECT, ...rejected]).buffer);
-    if (accepted.length) {
-      const out = new Uint32Array([T_PIXELS, ...accepted]).buffer;
-      for (const other of this.ctx.getWebSockets()) {
-        if (other === ws) continue;
-        const oa = other.deserializeAttachment() || {};
-        if ((WORLDS[oa.w] ? oa.w : 1) !== w) continue;   // yalnızca aynı dünyadakilere
-        try { other.send(out); } catch (e) { /* kapanmış bağlantı */ }
-      }
-      if ((await this.ctx.storage.getAlarm()) === null) {
-        await this.ctx.storage.setAlarm(Date.now() + FLUSH_MS);
-      }
-    }
-  }
-
-  async alarm() {
-    for (const w of [1, 2, 3]) {
-      for (const id of this.dirty[w]) {
-        const start = id * CHUNK;
-        const end = Math.min(N, start + CHUNK);
-        this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO " + WORLDS[w].table + " (id, data) VALUES (?, ?)",
-          id,
-          this.worlds[w].slice(start, end).buffer
-        );
-      }
-      this.dirty[w].clear();
-    }
-    for (const key of this.accDirty) {
-      const [a, wStr] = key.split("|");
-      const accId = Number(a), w = Number(wStr);
-      const c = this.accCache.get(accId);
-      const r = this.rates.get("a" + accId + "|" + w);
-      if (!c) continue;
-      const used = r ? r.used : 0, ts = r ? r.ts : Date.now();
-      this.ctx.storage.sql.exec("UPDATE accounts SET total = ? WHERE id = ?", c.total, accId);
-      if (w === 1) {
-        this.ctx.storage.sql.exec("UPDATE accounts SET used = ?, ts = ? WHERE id = ?", used, ts, accId);
-      } else {
-        this.ctx.storage.sql.exec(
-          "INSERT OR REPLACE INTO acc_rates (acc, w, used, ts) VALUES (?, ?, ?, ?)", accId, w, used, ts
-        );
-      }
-    }
-    this.accDirty.clear();
-    const cutoff = Date.now() - 5 * 60 * 1000;
-    for (const [k, v] of this.rates) if (v.ts < cutoff) this.rates.delete(k);
-  }
-
-  async webSocketClose(ws, code) {
-    try { ws.close(code === 1005 ? 1000 : code, "kapandı"); } catch (e) { /* zaten kapalı */ }
-    this.broadcastOnline(ws);
-  }
-
-  async webSocketError(ws) {
-    try { ws.close(1011, "hata"); } catch (e) { /* zaten kapalı */ }
-    this.broadcastOnline(ws);
-  }
-
-  broadcastOnline(except) {
-    const live = this.ctx.getWebSockets().filter((s) => s !== except && s.readyState === 1);
-    const groups = { 1: [], 2: [], 3: [] };
-    for (const s of live) {
-      const a = s.deserializeAttachment() || {};
-      groups[WORLDS[a.w] ? a.w : 1].push(s);
-    }
-    for (const w of [1, 2, 3]) {
-      const msg = new Uint32Array([T_ONLINE, groups[w].length]).buffer;
-      for (const s of groups[w]) {
-        try { s.send(msg); } catch (e) { /* kapanmış bağlantı */ }
-      }
-    }
-  }
-}
+    if (rejected.length) ws.
