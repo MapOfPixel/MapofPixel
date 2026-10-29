@@ -7,7 +7,13 @@ const W = 2334;
 const H = 2583;
 const N = W * H;
 const CHUNK = 65536;      // kayıt parçası: 65536 hücre
-const MAX_USED = 60;      // oyuncu başına sınır
+// Dünyalar: max = sayaç sınırı (saniye), empty/filled = boş / dolu hücreye piksel koymanın bedeli.
+// Sayaç saniyede 1 azalır. Dünya 1'in verisi eski "chunks" tablosunda durur, hiç dokunulmaz.
+const WORLDS = {
+  1: { max: 60,  empty: 1,   filled: 1, table: "chunks"  },
+  2: { max: 120, empty: 0.5, filled: 2, table: "chunks2" },
+  3: { max: 900, empty: 2,   filled: 4, table: "chunks3" },
+};
 const SLACK = 1;          // ağ gecikmesi payı
 const FLUSH_MS = 3000;    // değişiklikler en geç 3 sn'de kaydedilir
 const MAX_BATCH = 256;    // bir mesajda en fazla piksel
@@ -84,14 +90,21 @@ export default {
 export class World extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    this.world = new Uint8Array(N); // 0 = boş, 1..12 = renk numarası
-    this.dirty = new Set();
+    // 0 = boş, 1..12 = renk numarası. Üç ayrı dünya.
+    this.worlds = { 1: new Uint8Array(N), 2: new Uint8Array(N), 3: new Uint8Array(N) };
+    this.dirty = { 1: new Set(), 2: new Set(), 3: new Set() };
     this.rates = new Map();         // oyuncu kimliği -> { used, ts }
     this.accCache = new Map();      // hesap no -> { total }
     this.accDirty = new Set();
     this.throttles = new Map();     // IP sınırları (bellekte)
+    for (const w of [1, 2, 3]) {
+      this.ctx.storage.sql.exec(
+        "CREATE TABLE IF NOT EXISTS " + WORLDS[w].table + " (id INTEGER PRIMARY KEY, data BLOB)"
+      );
+    }
     this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY, data BLOB)"
+      "CREATE TABLE IF NOT EXISTS acc_rates (acc INTEGER NOT NULL, w INTEGER NOT NULL, " +
+      "used REAL NOT NULL DEFAULT 0, ts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (acc, w))"
     );
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS accounts (" +
@@ -105,11 +118,13 @@ export class World extends DurableObject {
     );
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     this.ctx.blockConcurrencyWhile(async () => {
-      for (const row of this.ctx.storage.sql.exec("SELECT id, data FROM chunks")) {
-        const start = row.id * CHUNK;
-        if (start >= N) continue;
-        const arr = new Uint8Array(row.data);
-        this.world.set(arr.subarray(0, Math.min(arr.length, N - start)), start);
+      for (const w of [1, 2, 3]) {
+        for (const row of this.ctx.storage.sql.exec("SELECT id, data FROM " + WORLDS[w].table)) {
+          const start = row.id * CHUNK;
+          if (start >= N) continue;
+          const arr = new Uint8Array(row.data);
+          this.worlds[w].set(arr.subarray(0, Math.min(arr.length, N - start)), start);
+        }
       }
     });
   }
@@ -237,6 +252,16 @@ export class World extends DurableObject {
     return { ok: true };
   }
 
+  // Hesabın bir dünyadaki sayacı. Dünya 1 eski "accounts" satırında, 2 ve 3 acc_rates içinde.
+  loadAccRate(accId, w) {
+    if (w === 1) {
+      const r = this.rows("SELECT used, ts FROM accounts WHERE id = ?", accId)[0];
+      return r ? { used: r.used, ts: r.ts } : { used: 0, ts: 0 };
+    }
+    const r = this.rows("SELECT used, ts FROM acc_rates WHERE acc = ? AND w = ?", accId, w)[0];
+    return r ? { used: r.used, ts: r.ts } : { used: 0, ts: 0 };
+  }
+
   // Bellekte daha yeni sayaç varsa onu kullan
   accountFresh(row) {
     const c = this.accCache.get(row.id);
@@ -270,33 +295,37 @@ export class World extends DurableObject {
     const acc = token ? await this.accountByToken(token) : null;
     // Misafir kimliği "g" ile başlar, hesap kimliği "a" ile: ikisi karışmaz
     const id = acc ? "a" + acc.id : "g" + ((url.searchParams.get("id") || "").slice(0, 40) || crypto.randomUUID());
+    const wq = parseInt(url.searchParams.get("w") || "1", 10);
+    const w = WORLDS[wq] ? wq : 1;
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment(acc ? { id, acc: acc.id } : { id });
+    server.serializeAttachment(acc ? { id, acc: acc.id, w } : { id, w });
     if (acc) {
       const now = Date.now();
-      let used = Math.max(0, acc.used - (now - acc.ts) / 1000);
-      const live = this.rates.get(id);
+      const rk = id + "|" + w;
+      const saved = this.loadAccRate(acc.id, w);
+      let used = Math.max(0, saved.used - (now - saved.ts) / 1000);
+      const live = this.rates.get(rk);
       if (live) used = Math.max(0, live.used - (now - live.ts) / 1000);
-      else this.rates.set(id, { used, ts: now });
+      else this.rates.set(rk, { used, ts: now });
       if (!this.accCache.has(acc.id)) this.accCache.set(acc.id, { total: acc.total });
       const c = this.accCache.get(acc.id);
-      server.send(JSON.stringify({ type: "account", account: { id: acc.id, name: acc.name, total: c.total, used } }));
+      server.send(JSON.stringify({ type: "account", account: { id: acc.id, name: acc.name, total: c.total, used, world: w } }));
     } else if (token) {
       server.send(JSON.stringify({ type: "badtoken" }));
     }
-    this.sendSnapshot(server);
+    this.sendSnapshot(server, w);
     this.broadcastOnline();
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  sendSnapshot(ws) {
+  sendSnapshot(ws, w) {
     const SZ = 40000;
     let buf = new Uint32Array(SZ + 1);
     buf[0] = T_SNAPSHOT;
     let n = 0;
-    const world = this.world;
+    const world = this.worlds[w];
     for (let i = 0; i < N; i++) {
       const c = world[i];
       if (c === 0) continue;
@@ -320,15 +349,16 @@ export class World extends DurableObject {
     const arr = new Uint32Array(message);
     const att = ws.deserializeAttachment() || {};
     const id = att.id || "gbilinmiyor";
+    const w = WORLDS[att.w] ? att.w : 1;      // eski bağlantılarda w yok: Dünya 1
+    const cfg = WORLDS[w];
+    const world = this.worlds[w];
+    const rk = id + "|" + w;
     const now = Date.now();
-    let r = this.rates.get(id);
+    let r = this.rates.get(rk);
     if (!r && att.acc) {
       // Sunucu belleği sıfırlandıysa hesabın sayacını veritabanından geri yükle
-      const row = this.rows("SELECT used, ts, total FROM accounts WHERE id = ?", att.acc)[0];
-      if (row) {
-        r = { used: Math.max(0, row.used - (now - row.ts) / 1000), ts: now };
-        if (!this.accCache.has(att.acc)) this.accCache.set(att.acc, { total: row.total });
-      }
+      const saved = this.loadAccRate(att.acc, w);
+      r = { used: Math.max(0, saved.used - (now - saved.ts) / 1000), ts: now };
     }
     if (!r) r = { used: 0, ts: now };
     r.used = Math.max(0, r.used - (now - r.ts) / 1000);
@@ -341,17 +371,19 @@ export class World extends DurableObject {
       const idx = v >>> 4;
       const c = v & 15;
       if (idx >= N || c < 1 || c > 12) continue;
-      if (this.world[idx] === c) continue;
-      if (r.used + 1 > MAX_USED + SLACK) {
-        rejected.push(idx * 16 + this.world[idx]);
+      const cur = world[idx];
+      if (cur === c) continue;
+      const cost = cur ? cfg.filled : cfg.empty;   // dolu hücre daha pahalı olabilir
+      if (r.used + cost > cfg.max + SLACK) {
+        rejected.push(idx * 16 + cur);
         continue;
       }
-      r.used += 1;
-      this.world[idx] = c;
-      this.dirty.add(idx >>> 16);
+      r.used += cost;
+      world[idx] = c;
+      this.dirty[w].add(idx >>> 16);
       accepted.push(v);
     }
-    this.rates.set(id, r);
+    this.rates.set(rk, r);
     if (att.acc) {
       let c = this.accCache.get(att.acc);
       if (!c) {
@@ -360,16 +392,17 @@ export class World extends DurableObject {
         this.accCache.set(att.acc, c);
       }
       c.total += accepted.length;
-      this.accDirty.add(att.acc);
+      this.accDirty.add(att.acc + "|" + w);
     }
 
     if (rejected.length) ws.send(new Uint32Array([T_REJECT, ...rejected]).buffer);
     if (accepted.length) {
       const out = new Uint32Array([T_PIXELS, ...accepted]).buffer;
       for (const other of this.ctx.getWebSockets()) {
-        if (other !== ws) {
-          try { other.send(out); } catch (e) { /* kapanmış bağlantı */ }
-        }
+        if (other === ws) continue;
+        const oa = other.deserializeAttachment() || {};
+        if ((WORLDS[oa.w] ? oa.w : 1) !== w) continue;   // yalnızca aynı dünyadakilere
+        try { other.send(out); } catch (e) { /* kapanmış bağlantı */ }
       }
       if ((await this.ctx.storage.getAlarm()) === null) {
         await this.ctx.storage.setAlarm(Date.now() + FLUSH_MS);
@@ -378,24 +411,33 @@ export class World extends DurableObject {
   }
 
   async alarm() {
-    for (const id of this.dirty) {
-      const start = id * CHUNK;
-      const end = Math.min(N, start + CHUNK);
-      this.ctx.storage.sql.exec(
-        "INSERT OR REPLACE INTO chunks (id, data) VALUES (?, ?)",
-        id,
-        this.world.slice(start, end).buffer
-      );
+    for (const w of [1, 2, 3]) {
+      for (const id of this.dirty[w]) {
+        const start = id * CHUNK;
+        const end = Math.min(N, start + CHUNK);
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO " + WORLDS[w].table + " (id, data) VALUES (?, ?)",
+          id,
+          this.worlds[w].slice(start, end).buffer
+        );
+      }
+      this.dirty[w].clear();
     }
-    this.dirty.clear();
-    for (const accId of this.accDirty) {
+    for (const key of this.accDirty) {
+      const [a, wStr] = key.split("|");
+      const accId = Number(a), w = Number(wStr);
       const c = this.accCache.get(accId);
-      const r = this.rates.get("a" + accId);
+      const r = this.rates.get("a" + accId + "|" + w);
       if (!c) continue;
-      this.ctx.storage.sql.exec(
-        "UPDATE accounts SET total = ?, used = ?, ts = ? WHERE id = ?",
-        c.total, r ? r.used : 0, r ? r.ts : Date.now(), accId
-      );
+      const used = r ? r.used : 0, ts = r ? r.ts : Date.now();
+      this.ctx.storage.sql.exec("UPDATE accounts SET total = ? WHERE id = ?", c.total, accId);
+      if (w === 1) {
+        this.ctx.storage.sql.exec("UPDATE accounts SET used = ?, ts = ? WHERE id = ?", used, ts, accId);
+      } else {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO acc_rates (acc, w, used, ts) VALUES (?, ?, ?, ?)", accId, w, used, ts
+        );
+      }
     }
     this.accDirty.clear();
     const cutoff = Date.now() - 5 * 60 * 1000;
@@ -414,9 +456,16 @@ export class World extends DurableObject {
 
   broadcastOnline(except) {
     const live = this.ctx.getWebSockets().filter((s) => s !== except && s.readyState === 1);
-    const msg = new Uint32Array([T_ONLINE, live.length]).buffer;
+    const groups = { 1: [], 2: [], 3: [] };
     for (const s of live) {
-      try { s.send(msg); } catch (e) { /* kapanmış bağlantı */ }
+      const a = s.deserializeAttachment() || {};
+      groups[WORLDS[a.w] ? a.w : 1].push(s);
+    }
+    for (const w of [1, 2, 3]) {
+      const msg = new Uint32Array([T_ONLINE, groups[w].length]).buffer;
+      for (const s of groups[w]) {
+        try { s.send(msg); } catch (e) { /* kapanmış bağlantı */ }
+      }
     }
   }
 }
